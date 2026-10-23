@@ -3118,7 +3118,7 @@ fn covers(seed: &WrapArea, area: &WrapArea) -> bool {
     let inside = r.x >= s.x - 0.5 && r.y >= s.y - 0.5 && r.right() <= s.right() + 0.5 && r.bottom() <= s.bottom() + 0.5;
     let same_place = (r.x - s.x).abs() < 0.5 && (r.y - s.y).abs() < 0.5 && (r.w - s.w).abs() < 0.5 && (r.h - s.h).abs() < 0.5;
     let outline = seed.2.is_none() || (same_place && seed.2 == area.2);
-    (seed.3 == area.3 || seed.1) && (seed.1 || !area.1) && inside && outline
+    (seed.1 || seed.3 == area.3 && !area.1) && inside && outline
 }
 
 /// In a pass no other follows ([`MAX_REWRAP_PASSES`]), a float at `r` with wrap area `area`
@@ -4420,7 +4420,7 @@ fn place_table(ctx: &mut Ctx, pb: &mut PageBuilder, t: &wordcraft_doc::Table, bl
                 && !pb.at_top()
                 && !fresh
                 && rest.is_none()
-                && !ri.checked_sub(1).and_then(|prev| kept.get(prev)).is_some_and(|&(end, _)| end >= ri)
+                && ri.checked_sub(1).and_then(|prev| kept.get(prev)).is_none_or(|&(end, _)| end < ri)
                 && kept.get(ri).is_some_and(|&(end, height)| {
                     if end == ri {
                         return false;

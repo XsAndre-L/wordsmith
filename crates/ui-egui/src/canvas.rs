@@ -36,14 +36,20 @@ const EDGE_MAX_DT: f32 = 0.1;
 const TEXTURE_KEEP_SCREENS: f32 = 3.0;
 
 pub struct CanvasState {
-    textures: HashMap<usize, (u64, TextureHandle)>,
+    textures: HashMap<usize, PageTexture>,
     /// Visible full-resolution tiles of pages too tall for one GPU texture.
-    tiles: HashMap<(usize, usize), (u64, TextureHandle)>,
+    tiles: HashMap<(usize, u32, usize), PageTexture>,
+    pub(crate) zoom: crate::zoom_render::Zoom,
+    pub(crate) refinement: crate::zoom_render::Refinement,
     /// Page content fingerprints of the current layout, for the texture cache (#811).
     pub(crate) page_keys: PageKeys,
     /// Whether the document has tracked formatting changes, moves and deletions, by document
     /// revision: finding out walks every paragraph, too slow for every frame (#811).
     markup_facts: std::cell::Cell<Option<((u64, u64), [bool; 3])>>,
+    media_key: std::cell::Cell<Option<(u64, u64, u64)>>,
+    // Keep the fingerprinted media alive: copy-on-write edits change identity and allocator
+    // address reuse cannot make replacement picture bytes look like the previous picture.
+    media_refs: std::cell::RefCell<Vec<std::sync::Arc<Vec<u8>>>>,
     pub scroll_to_caret: bool,
     /// Set while a command runs for a mouse drag on a table: the pointer is already
     /// on the target, so the view stays put instead of following the caret (#1738).
@@ -197,6 +203,21 @@ pub struct CanvasState {
     pub(crate) drawn_ibeam: bool,
 }
 
+struct PageTexture {
+    content: u64,
+    scale: f32,
+    start: f32,
+    height: f32,
+    uv: Rect,
+    tex: TextureHandle,
+}
+
+impl PageTexture {
+    fn bytes(&self) -> usize {
+        self.tex.size().iter().copied().fold(4usize, usize::saturating_mul)
+    }
+}
+
 impl CanvasState {
     /// Stop a text-selection drag when the pointer gesture becomes an object drag.
     pub(crate) fn cancel_text_drag(&mut self) {
@@ -229,8 +250,12 @@ impl Default for CanvasState {
         CanvasState {
             textures: HashMap::new(),
             tiles: HashMap::new(),
+            zoom: Default::default(),
+            refinement: Default::default(),
             page_keys: PageKeys::default(),
             markup_facts: std::cell::Cell::new(None),
+            media_key: std::cell::Cell::new(None),
+            media_refs: Default::default(),
             scroll_to_caret: true,
             keep_view: false,
             nav_to_caret: false,
@@ -758,7 +783,21 @@ fn view_key(app: &WordApp, dim_body: bool, hidden: Option<&Pos>) -> u64 {
     dim_body.hash(&mut h);
     format!("{:?}{:?}{:?}", app.session.doc.settings.page_color, app.session.doc.settings.page_picture, app.session.doc.settings.watermark)
         .hash(&mut h);
-    app.session.doc.media.len().hash(&mut h);
+    let (id, rev) = (app.session.document_id(), app.session.rev());
+    let media = match app.canvas.media_key.get() {
+        Some((d, r, key)) if (d, r) == (id, rev) => key,
+        _ => {
+            let mut media = std::collections::hash_map::DefaultHasher::new();
+            for (name, bytes) in &app.session.doc.media {
+                (name, std::sync::Arc::as_ptr(bytes)).hash(&mut media);
+            }
+            let key = media.finish();
+            *app.canvas.media_refs.borrow_mut() = app.session.doc.media.values().cloned().collect();
+            app.canvas.media_key.set(Some((id, rev, key)));
+            key
+        }
+    };
+    media.hash(&mut h);
     // A page drawn without a dragged object must not pass for the page with it: the drag starts
     // and ends change the key once each, so the page is rendered again then and only then.
     hidden.hash(&mut h);
@@ -830,7 +869,7 @@ impl PageKeys {
 /// The texture cache key of page `i`: its content, the view, and the raster scale.
 fn page_key(app: &mut WordApp, layout: &std::sync::Arc<DocLayout>, i: usize, view: u64, scale_px: f32) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (view, scale_px.to_bits(), app.canvas.page_keys.content(layout, i)).hash(&mut h);
+    (app.session.document_id(), view, scale_px.to_bits(), app.canvas.page_keys.content(layout, i)).hash(&mut h);
     h.finish()
 }
 
@@ -843,6 +882,17 @@ fn to_screen(origin: Pos2, page_rect: Rect, scale: f32, x: f32, y: f32) -> Pos2 
 /// passes over every pixel of the page, on each keystroke.
 fn page_image(img: &wordcraft_render::Rendered) -> egui::ColorImage {
     egui::ColorImage::from_rgba_premultiplied([img.width as usize, img.height as usize], &img.pixels)
+}
+
+fn upload_page(ctx: &egui::Context, img: &wordcraft_render::Rendered, metrics: &mut crate::zoom_render::Metrics) -> TextureHandle {
+    let start = crate::now_ms();
+    let image = page_image(img);
+    metrics.conversion_ms = crate::now_ms() - start;
+    let start = crate::now_ms();
+    let tex = ctx.load_texture("document-page", image, egui::TextureOptions::LINEAR);
+    metrics.texture_submit_ms = crate::now_ms() - start;
+    metrics.pixels_uploaded = metrics.pixels_uploaded.saturating_add(u64::from(img.width) * u64::from(img.height));
+    tex
 }
 
 /// Place a raster at a physical-pixel-aligned origin and its exact device-pixel size.
@@ -926,7 +976,13 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     // During a resize keep the already laid-out pages ([`Settle`]); ordinary reading controls
     // and zoom update now.
     let mut reflow_anchor: Option<Pos> = None;
+    let mut web_reflow_anchor: Option<(Pos, f32)> = None;
     let now = ui.input(|i| i.time);
+    if ui.input(|i| {
+        i.events.iter().any(|e| matches!(e, egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut | egui::Event::Key { pressed: true, .. }))
+    }) {
+        app.canvas.zoom.finish();
+    }
     if app.session.view.read_mode {
         app.canvas.web_viewport.leave();
         let entering = app.canvas.read_viewport.entering();
@@ -934,7 +990,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         let (w, h) = reading_size(full.size(), scale, app.session.view.read_column_width);
         let changed = (app.session.view.read_width - w).abs() > 0.5 || (app.session.view.read_height - h).abs() > 0.5;
         let forced = std::mem::take(&mut app.canvas.read_force_reflow) || entering;
-        if app.canvas.read_viewport.apply(full.size(), now, changed, forced) {
+        if (forced || !app.canvas.zoom.active(now)) && app.canvas.read_viewport.apply(full.size(), now, changed, forced) {
             if !entering {
                 reflow_anchor = app.canvas.read_first_visible.clone();
             }
@@ -956,10 +1012,27 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             let w = web_layout_width(full.width() - SCROLLBAR, scale);
             let changed = (app.session.view.web_width - w).abs() > 0.5;
             let entering = app.canvas.web_viewport.entering();
-            if app.canvas.web_viewport.apply(full.size(), now, changed, false) {
+            if !app.canvas.zoom.active(now) && app.canvas.web_viewport.apply(full.size(), now, changed, false) {
+                // Capture against the still-committed layout, only when reflow is needed.
+                // Scanning hit targets every preview frame would defeat cached zooming.
+                if !entering
+                    && !app.canvas.scroll_to_caret
+                    && let Some(vp) = app.canvas.viewport
+                {
+                    let point = vp.min + vec2(40.0, 12.0);
+                    let old = app.session.layout();
+                    if let Some(p) = nearest_page(&app.canvas.page_rects, point)
+                        && let Some(rect) = app.canvas.page_rects.get(p)
+                        && let Some(pos) =
+                            old.hit(p, (point.x - rect.min.x) / app.canvas.scale, (point.y - rect.min.y) / app.canvas.scale, StoryRef::Body)
+                        && let Some(caret) = old.caret_on(&pos, p)
+                    {
+                        web_reflow_anchor = Some((pos, rect.min.y + caret.top * app.canvas.scale - vp.min.y));
+                    }
+                }
                 app.session.view.web_width = w;
                 // The pixel offset no longer points at the same text: keep the caret's line in view.
-                app.canvas.scroll_to_caret |= !entering;
+                app.canvas.scroll_to_caret |= !entering && web_reflow_anchor.is_none();
             } else if changed {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(170));
             }
@@ -1026,7 +1099,12 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         let pct = (app.canvas.scale / PX_PER_PT * zoom_delta * 100.0).clamp(if reading { 75.0 } else { 10.0 }, if reading { 150.0 } else { 500.0 });
         let id = if reading { "view.readTextSize" } else { "view.zoom" };
         app.canvas.wheel.cancel();
+        if animate {
+            app.canvas.zoom.gesture(now);
+        }
+        app.canvas.zoom.continuous_command = animate;
         let _ = app.run(id, json!({"value": pct}));
+        app.canvas.zoom.continuous_command = false;
     }
     let avail = if app.session.view.read_mode { area.size() } else { area.size() - vec2(SCROLLBAR, 0.0) };
     let geo = geometry(app, &layout, avail);
@@ -1043,6 +1121,15 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     }
     app.canvas.scale = geo.scale;
     sync_fit_zoom(app, geo.scale);
+    if !app.canvas.scroll_to_caret
+        && let Some((pos, offset)) = web_reflow_anchor
+        && let Some(caret) = layout.caret_on(&pos, 0)
+        && let Some(pr) = geo.rects.get(caret.page)
+        && let Some(vp) = app.canvas.viewport
+    {
+        app.canvas.scroll_max = (geo.size - vp.size()).max(egui::Vec2::ZERO);
+        app.canvas.scroll_request = Some(vec2(app.canvas.scroll_offset.x, pr.min.y + caret.top * geo.scale - offset));
+    }
     // A pointer zoom scrolls so the same page point is under the pointer at the new scale, also
     // when the pages reflow into rows. Without this the scroll offset stayed in pixels and the page
     // slid away under the pointer.
@@ -1217,10 +1304,18 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         let clip = if app.session.view.read_mode { ui.clip_rect().shrink2(vec2(3.0, 0.0)) } else { ui.clip_rect() };
         let painter = ui.painter_at(clip);
         let ppp = ui.ctx().pixels_per_point();
+        let raster_target = app.canvas.zoom.raster_scale(geo.scale * ppp, now);
+        if app.canvas.zoom.active(now) {
+            app.canvas.refinement.metrics.preview_frames += 1;
+            ui.ctx().request_repaint_after(app.canvas.zoom.remaining(now));
+        }
+        app.canvas.refinement.begin_frame(app.session.document_id(), app.session.rev());
         let max_tex = ui.ctx().input(|i| i.max_texture_side).min(wordcraft_render::MAX_SIDE as usize).max(1) as f32;
         let mut visible_tile_keys = HashSet::new();
         let mut rendered = 0;
         let t0 = crate::now_ms();
+        let foreground_before = app.canvas.refinement.metrics.foreground_jobs;
+        let uploaded_before = app.canvas.refinement.metrics.pixels_uploaded;
         let mut rects = Vec::with_capacity(geo.rects.len());
         let content_origin = ui.min_rect().min;
         // The object a move has taken off its page: the page is drawn again without it (or it
@@ -1231,52 +1326,109 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             let sr = pr.translate(content_origin.to_vec2());
             let Some(page) = layout.pages.get(i) else { continue };
             let (band_top, band_bot) = geo.bands.get(i).copied().unwrap_or((0.0, sr.height()));
+            let content = if sr.intersects(ui.clip_rect().expand(200.0)) || app.canvas.textures.contains_key(&i) {
+                page_key(app, &layout, i, view, 0.0)
+            } else {
+                0
+            };
+            let page_raster = if app.canvas.zoom.active(now) {
+                app.canvas
+                    .textures
+                    .get(&i)
+                    .filter(|t| t.content == content)
+                    .map(|t| t.scale)
+                    .or_else(|| app.canvas.tiles.iter().find(|((p, _, _), t)| *p == i && t.content == content).map(|(_, t)| t.scale))
+                    .unwrap_or(raster_target.min(1.0))
+            } else {
+                raster_target
+            };
             // A Web/Draft page can be arbitrarily tall. Shrinking the whole page into one GPU
             // texture makes the text blurry; split those pages into native-resolution tiles.
-            let width_scale = (geo.scale * ppp).min(max_tex / page.w.max(1.0)).max(0.05);
-            let tiled = page.h.clamp(1.0, 1e6) * width_scale > max_tex;
+            let width_scale = page_raster.min(max_tex / page.w.max(1.0)).max(0.05);
+            let pixels_w = (page.w.max(1.0) * width_scale).ceil().max(1.0) as usize;
+            let tiled = page.h.clamp(1.0, 1e6) * width_scale > max_tex
+                || pixels_w as f64 * (page.h.max(1.0) * width_scale).ceil() as f64 > crate::zoom_render::MAX_JOB_PIXELS as f64;
             let scale_px = if tiled { width_scale } else { width_scale.min(max_tex / page.h.clamp(1.0, 1e6)).max(0.05) };
-            let tile_height_px = TILE_HEIGHT_PX.min(max_tex as usize).max(1);
+            let tile_height_px = TILE_HEIGHT_PX.min(max_tex as usize).min(crate::zoom_render::MAX_JOB_PIXELS / pixels_w).saturating_sub(2).max(1);
             // Hide White Space shows only a band of the page; everything below paints into it.
             let band_of = |r: Rect| Rect::from_min_max(pos2(r.min.x - 4.0, r.min.y + band_top), pos2(r.max.x + 4.0, r.min.y + band_bot));
             let visible = band_of(sr).intersects(ui.clip_rect().expand(200.0));
             // Only pages on screen or with a texture need their key (#811).
-            let cached = !tiled && app.canvas.textures.contains_key(&i);
-            let key =
-                if visible || cached { page_key(app, &layout, i, view, scale_px) ^ if tiled { (tile_height_px as u64) << 32 } else { 0 } } else { 0 };
-            let mut fresh = cached && app.canvas.textures.get(&i).is_some_and(|(k, _)| *k == key);
+            let fresh = app.canvas.textures.get(&i).is_some_and(|t| t.content == content && t.scale == scale_px);
+            let preview = app.canvas.textures.get(&i).is_some_and(|t| t.content == content && t.scale != scale_px)
+                || app.canvas.tiles.iter().any(|((p, _, _), t)| *p == i && t.content == content && t.scale != scale_px);
+            let content_changed = app.canvas.textures.get(&i).is_some_and(|t| t.content != content)
+                || app.canvas.tiles.iter().any(|((p, _, _), t)| *p == i && t.content != content);
+            // Retain only the nearest previous resolution, not a history of pinch events.
+            let previous = app
+                .canvas
+                .tiles
+                .iter()
+                .filter(|((p, bits, _), t)| *p == i && *bits != scale_px.to_bits() && t.content == content)
+                .min_by(|(_, a), (_, b)| (a.scale / scale_px).ln().abs().total_cmp(&(b.scale / scale_px).ln().abs()))
+                .map(|((_, bits, _), _)| *bits);
+            app.canvas.tiles.retain(|(p, bits, _), t| *p != i || (t.content == content && (*bits == scale_px.to_bits() || Some(*bits) == previous)));
             // The page a drag took an object off: render it this frame whatever the budget, or the
             // raster with the object still on it shows for a frame.
-            let forced = hidden.as_ref().is_some_and(|(page, _)| *page == i);
+            let forced = content_changed || hidden.as_ref().is_some_and(|(page, _)| *page == i);
             // Render before placing the page: a page re-rendered in this frame (a zoom step, an
             // edit) then sits on the pixel grid in this frame too, rather than a frame later.
-            if visible && !tiled && !fresh && (forced || rendered < 2 || !app.canvas.textures.contains_key(&i) && rendered < 4) {
+            let pixel_cost = pixels_w as u64 * (page.h.max(1.0) * scale_px).ceil() as u64;
+            let budget = rendered == 0
+                || (crate::now_ms() - t0 < 4.0
+                    && app.canvas.refinement.metrics.pixels_uploaded.saturating_sub(uploaded_before).saturating_add(pixel_cost)
+                        <= crate::zoom_render::MAX_JOB_PIXELS as u64);
+            if visible && !tiled && !fresh && (forced || budget) {
                 let mut opts = page_render_options(app, dim_body);
                 // Only on the page it is on: the `Pos` can't match an object of another page.
                 opts.display.hide_object = hidden.as_ref().filter(|(page, _)| *page == i).map(|(_, p)| p.clone());
-                let img = wordcraft_render::render_page(&app.session.doc, page, scale_px, &opts);
-                let ci = page_image(&img);
-                match app.canvas.textures.get_mut(&i) {
-                    Some((k, tex)) => {
-                        tex.set(ci, egui::TextureOptions::LINEAR);
-                        *k = key;
-                    }
-                    None => {
-                        let tex = ui.ctx().load_texture(format!("page{i}"), ci, egui::TextureOptions::LINEAR);
-                        app.canvas.textures.insert(i, (key, tex));
-                    }
+                let img = if preview && !forced && app.canvas.refinement.metrics.foreground_jobs != foreground_before {
+                    ui.ctx().request_repaint();
+                    None
+                } else if preview && !forced && !app.canvas.refinement.failed() {
+                    app.canvas.refinement.request(
+                        crate::zoom_render::Key {
+                            document: app.session.document_id(),
+                            revision: app.session.rev(),
+                            content,
+                            page: i,
+                            scale: scale_px.to_bits(),
+                            tile: 0,
+                            height: 0,
+                        },
+                        &app.session.doc,
+                        &layout,
+                        opts,
+                        [0.0, 0.0, page.w, page.h],
+                        ui.ctx(),
+                    )
+                } else {
+                    app.canvas.refinement.metrics.foreground_jobs += 1;
+                    Some(wordcraft_render::render_page(&app.session.doc, page, scale_px, &opts))
+                };
+                if let Some(img) = img {
+                    let tex = upload_page(ui.ctx(), &img, &mut app.canvas.refinement.metrics);
+                    app.canvas.textures.insert(
+                        i,
+                        PageTexture {
+                            content,
+                            scale: scale_px,
+                            start: 0.0,
+                            height: page.h,
+                            uv: Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            tex,
+                        },
+                    );
+                    rendered += 1;
+                    ui.ctx().request_repaint();
                 }
-                rendered += 1;
-                fresh = true;
             } else if visible && !tiled && !fresh {
                 ui.ctx().request_repaint();
             }
-            let current_scale = geo.scale * ppp;
-            let visual_sr = if fresh && (scale_px - current_scale).abs() <= 0.0001_f32.max(current_scale.abs() * 0.0001) {
-                app.canvas.textures.get(&i).map_or(sr, |(_, tex)| texel_aligned_rect(sr, tex.size_vec2(), ppp))
-            } else {
-                sr
-            };
+            // Geometry is independent of whether final pixels have arrived. Refinement cannot
+            // move the anchor, selection or caret by changing texture dimensions.
+            let visual_sr = sr;
+            let image_sr = texel_aligned_rect(sr, (sr.size() * ppp).ceil(), ppp);
             rects.push(visual_sr);
             if !visible {
                 continue;
@@ -1290,63 +1442,123 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             // Shadow and paper.
             painter.rect_filled(visual_sr.translate(vec2(0.0, 2.0)).expand(1.5), 1.0, t.page_shadow);
             painter.rect_filled(visual_sr, 0.0, if dark_page { Color32::from_gray(dark_paper) } else { Color32::WHITE });
+            if let Some(t) = app.canvas.textures.get(&i).filter(|t| t.content == content) {
+                painter.image(t.tex.id(), image_sr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            // Old-resolution tiles remain usable in document coordinates while new ones arrive.
+            for ((p, bits, tile), t) in &app.canvas.tiles {
+                if *p != i
+                    || t.content != content
+                    || t.scale == scale_px
+                    || (!tiled && app.canvas.textures.get(&i).is_some_and(|t| t.content == content && t.scale == scale_px))
+                {
+                    continue;
+                }
+                let rect =
+                    Rect::from_min_size(pos2(image_sr.min.x, image_sr.min.y + t.start * geo.scale), vec2(image_sr.width(), t.height * geo.scale));
+                if rect.intersects(ui.clip_rect().expand(200.0)) {
+                    visible_tile_keys.insert((*p, *bits, *tile));
+                    painter.image(t.tex.id(), rect, t.uv, Color32::WHITE);
+                }
+            }
             if tiled {
                 // Render before painting to keep the frame sharp immediately after an edit or
                 // zoom. Tiles are fixed to raster-pixel boundaries, independent of scrolling.
-                app.canvas.textures.remove(&i);
                 let total_px = (page.h.clamp(1.0, 1e6) * scale_px).ceil() as usize;
                 let screen_per_raster_px = geo.scale / scale_px;
-                let base = pos2((sr.min.x * ppp).round() / ppp, (sr.min.y * ppp).round() / ppp);
+                let base = image_sr.min;
                 for tile in visible_tiles(sr, ui.clip_rect().expand(200.0).intersect(band), geo.scale, scale_px, tile_height_px) {
                     let start_px = tile.saturating_mul(tile_height_px);
                     let height_px = total_px.saturating_sub(start_px).min(tile_height_px);
                     if height_px == 0 {
                         continue;
                     }
-                    let id = (i, tile);
+                    let id = (i, scale_px.to_bits(), tile);
                     visible_tile_keys.insert(id);
-                    let fresh = app.canvas.tiles.get(&id).is_some_and(|(k, _)| *k == key);
-                    if !fresh && rendered < 4 {
+                    let fresh = app.canvas.tiles.get(&id).is_some_and(|t| t.content == content);
+                    let budget = rendered == 0
+                        || (crate::now_ms() - t0 < 4.0
+                            && app
+                                .canvas
+                                .refinement
+                                .metrics
+                                .pixels_uploaded
+                                .saturating_sub(uploaded_before)
+                                .saturating_add(pixels_w as u64 * height_px as u64)
+                                <= crate::zoom_render::MAX_JOB_PIXELS as u64);
+                    if !fresh && (forced || budget) {
                         let mut opts = page_render_options(app, dim_body);
                         // Only on the page it is on: the `Pos` can't match an object of another page.
                         opts.display.hide_object = hidden.as_ref().filter(|(page, _)| *page == i).map(|(_, p)| p.clone());
                         // The tiny subtraction avoids a 1px overshoot from round-tripping f32
                         // pixels through page points and render_area's ceil() conversion.
-                        let img = wordcraft_render::render_area(
-                            &app.session.doc,
-                            page,
-                            0.0,
-                            start_px as f32 / scale_px,
-                            page.w,
-                            (height_px as f32 - 0.01).max(0.01) / scale_px,
-                            scale_px,
-                            &opts,
-                        );
-                        let ci = page_image(&img);
-                        match app.canvas.tiles.get_mut(&id) {
-                            Some((k, tex)) => {
-                                tex.set(ci, egui::TextureOptions::LINEAR);
-                                *k = key;
-                            }
-                            None => {
-                                let tex = ui.ctx().load_texture(format!("page{i}-tile{tile}"), ci, egui::TextureOptions::LINEAR);
-                                app.canvas.tiles.insert(id, (key, tex));
-                            }
+                        // One extra raster row on each interior edge keeps linear sampling of
+                        // scaled preview tiles from clamping to a cut glyph at the seam.
+                        let render_start = start_px.saturating_sub(1);
+                        let render_end = start_px.saturating_add(height_px).saturating_add(1).min(total_px);
+                        let render_height = render_end.saturating_sub(render_start);
+                        let area = [0.0, render_start as f32 / scale_px, page.w, (render_height as f32 - 0.01).max(0.01) / scale_px];
+                        let img = if preview && !forced && app.canvas.refinement.metrics.foreground_jobs != foreground_before {
+                            ui.ctx().request_repaint();
+                            None
+                        } else if preview && !forced && !app.canvas.refinement.failed() {
+                            app.canvas.refinement.request(
+                                crate::zoom_render::Key {
+                                    document: app.session.document_id(),
+                                    revision: app.session.rev(),
+                                    content,
+                                    page: i,
+                                    scale: scale_px.to_bits(),
+                                    tile,
+                                    height: tile_height_px,
+                                },
+                                &app.session.doc,
+                                &layout,
+                                opts,
+                                area,
+                                ui.ctx(),
+                            )
+                        } else {
+                            app.canvas.refinement.metrics.foreground_jobs += 1;
+                            Some(wordcraft_render::render_area(&app.session.doc, page, area[0], area[1], area[2], area[3], scale_px, &opts))
+                        };
+                        if let Some(img) = img {
+                            let tex = upload_page(ui.ctx(), &img, &mut app.canvas.refinement.metrics);
+                            let uv = Rect::from_min_max(
+                                pos2(0.0, (start_px - render_start) as f32 / img.height.max(1) as f32),
+                                pos2(1.0, (start_px - render_start + height_px) as f32 / img.height.max(1) as f32),
+                            );
+                            app.canvas.tiles.insert(
+                                id,
+                                PageTexture {
+                                    content,
+                                    scale: scale_px,
+                                    start: start_px as f32 / scale_px,
+                                    height: height_px as f32 / scale_px,
+                                    uv,
+                                    tex,
+                                },
+                            );
+                            rendered += 1;
+                            ui.ctx().request_repaint();
                         }
-                        rendered += 1;
                     } else if !fresh {
                         ui.ctx().request_repaint();
                     }
-                    if let Some((_, tex)) = app.canvas.tiles.get(&id) {
+                    if let Some(t) = app.canvas.tiles.get(&id).filter(|t| t.content == content) {
                         let rect = Rect::from_min_size(
                             pos2(base.x, base.y + start_px as f32 * screen_per_raster_px),
-                            vec2(tex.size_vec2().x * screen_per_raster_px, height_px as f32 * screen_per_raster_px),
+                            vec2(image_sr.width(), height_px as f32 * screen_per_raster_px),
                         );
-                        painter.image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                        painter.image(t.tex.id(), rect, t.uv, Color32::WHITE);
                     }
                 }
-            } else if let Some((_, tex)) = app.canvas.textures.get(&i) {
-                painter.image(tex.id(), visual_sr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                let complete = visible_tiles(sr, ui.clip_rect().expand(200.0).intersect(band), geo.scale, scale_px, tile_height_px)
+                    .all(|tile| app.canvas.tiles.get(&(i, scale_px.to_bits(), tile)).is_some_and(|t| t.content == content));
+                if complete {
+                    visible_tile_keys.retain(|(p, bits, _)| *p != i || *bits == scale_px.to_bits());
+                    app.canvas.textures.remove(&i);
+                }
             }
             let page_scale = page_screen_scale(visual_sr, page, geo.scale);
             // Header/footer editing chrome.
@@ -1410,9 +1622,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 painter.rect_filled(Rect::from_min_max(pos2(pair[0].min.x, y), pos2(pair[0].max.x, y + SEAM)), 0.0, t.border_strong);
             }
         }
-        if rendered > 0 {
-            app.canvas.render_ms = crate::now_ms() - t0;
-        }
+        app.canvas.render_ms = if rendered > 0 { crate::now_ms() - t0 } else { 0.0 };
         // Drop textures of pages that no longer exist, and of pages scrolled well out of view
         // (#811): scrolling through a long document kept every page it had shown in memory.
         let n = layout.pages.len();
@@ -1420,6 +1630,35 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         let near = clip.expand2(vec2(clip.width(), clip.height() * TEXTURE_KEEP_SCREENS));
         app.canvas.textures.retain(|k, _| *k < n && geo.rects.get(*k).is_some_and(|r| r.translate(content_origin.to_vec2()).intersects(near)));
         app.canvas.tiles.retain(|id, _| visible_tile_keys.contains(id));
+        // GPU texture budget; result buffers and uploads have a separate per-job cap.
+        let mut bytes: usize = app.canvas.textures.values().chain(app.canvas.tiles.values()).map(PageTexture::bytes).sum();
+        if bytes > 64 * 1024 * 1024 {
+            app.canvas.tiles.retain(|(_, bits, _), t| {
+                if bytes > 64 * 1024 * 1024 && *bits != raster_target.to_bits() {
+                    bytes = bytes.saturating_sub(t.bytes());
+                    false
+                } else {
+                    true
+                }
+            });
+            app.canvas.textures.retain(|_, t| {
+                if bytes > 64 * 1024 * 1024 {
+                    bytes = bytes.saturating_sub(t.bytes());
+                    false
+                } else {
+                    true
+                }
+            });
+            app.canvas.tiles.retain(|_, t| {
+                if bytes > 64 * 1024 * 1024 {
+                    bytes = bytes.saturating_sub(t.bytes());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        app.canvas.refinement.metrics.cache_bytes = bytes;
         app.canvas.page_rects = rects.clone();
         let view_rect = ui.clip_rect();
         if floating_comments(app) {

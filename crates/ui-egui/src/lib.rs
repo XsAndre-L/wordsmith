@@ -86,6 +86,7 @@ pub mod widgets;
 pub mod window_close;
 pub mod window_geometry;
 pub mod wordart_menus;
+mod zoom_render;
 pub mod zotero;
 
 use serde::{Deserialize, Serialize};
@@ -1399,8 +1400,13 @@ impl WordApp {
         if id == "view.outline" {
             self.ui.nav_tab = "headings".into();
         }
-        if matches!(id, "view.readColumnWidth" | "view.readTextSize" | "view.readLineSpacing") {
+        if matches!(id, "view.readColumnWidth" | "view.readTextSize" | "view.readLineSpacing") && !self.canvas.zoom.continuous_command {
             self.canvas.read_force_reflow = true;
+        }
+        if (id.starts_with("view.zoom") || matches!(id, "view.readTextSize" | "view.onePage" | "view.pageWidth" | "view.multiplePages"))
+            && !self.canvas.zoom.continuous_command
+        {
+            self.canvas.zoom.finish();
         }
         if id == "view.readMode" {
             self.canvas.read_first_visible = None;
@@ -4365,6 +4371,74 @@ mod tests {
         assert!(scale < stepped);
         frame(&mut a, Vec::new());
         assert_eq!((a.canvas.scale, &a.canvas.page_rects), (scale, &pages));
+    }
+
+    #[test]
+    fn continuous_zoom_reuses_pixels_and_print_layout_but_edits_stay_current() {
+        let ctx = egui::Context::default();
+        let system = std::rc::Rc::new(std::cell::Cell::new(Some(true)));
+        let mut a = app_with_system_animations(&system);
+        a.run("text.insert", json!({"text": "Zoom preview stays responsive"})).unwrap();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let mut time = 0.0;
+        let mut frame = |a: &mut WordApp, events: Vec<egui::Event>| {
+            time += 1.0 / 60.0;
+            ctx.run_ui(egui::RawInput { events, time: Some(time), screen_rect: Some(screen), ..Default::default() }, |ui| {
+                a.logic(ui.ctx());
+                a.ui(ui);
+            })
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..4 {
+            frame(&mut a, vec![]);
+        }
+        let point = a.canvas.canvas_rect.unwrap().center();
+        let before = a.session.layout();
+        let pixels = a.canvas.refinement.metrics.pixels_uploaded;
+        let jobs = a.canvas.refinement.metrics.foreground_jobs;
+        let scale = a.canvas.scale;
+        for _ in 0..20 {
+            frame(&mut a, vec![egui::Event::PointerMoved(point), egui::Event::Zoom(1.01)]);
+        }
+        assert!(a.canvas.scale > scale);
+        assert!(std::sync::Arc::ptr_eq(&before, &a.session.layout()));
+        assert_eq!(a.canvas.refinement.metrics.foreground_jobs, jobs, "warm pinch does not rasterize");
+        assert_eq!(a.canvas.refinement.metrics.pixels_uploaded, pixels, "warm pinch does not upload pixels");
+        a.run("text.insert", json!({"text": " edited"})).unwrap();
+        frame(&mut a, vec![]);
+        assert!(a.canvas.refinement.metrics.foreground_jobs > jobs, "an edit cannot reuse stale content");
+    }
+
+    #[test]
+    fn read_zoom_gesture_defers_reflow_but_discrete_command_does_not() {
+        let ctx = egui::Context::default();
+        let system = std::rc::Rc::new(std::cell::Cell::new(Some(true)));
+        let mut a = app_with_system_animations(&system);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let frame = |a: &mut WordApp, time| {
+            ctx.run_ui(egui::RawInput { time: Some(time), screen_rect: Some(screen), ..Default::default() }, |ui| {
+                a.logic(ui.ctx());
+                a.ui(ui);
+            })
+            .drop_without_applying_deltas();
+        };
+        frame(&mut a, 0.5);
+        frame(&mut a, 0.6);
+        a.run("view.readMode", json!({})).unwrap();
+        frame(&mut a, 1.0);
+        frame(&mut a, 1.1);
+        let before = (a.session.view.read_width, a.session.view.read_height);
+        a.canvas.zoom.gesture(1.2);
+        a.canvas.zoom.continuous_command = true;
+        a.run("view.readTextSize", json!({"value": 125})).unwrap();
+        a.canvas.zoom.continuous_command = false;
+        frame(&mut a, 1.21);
+        assert_eq!((a.session.view.read_width, a.session.view.read_height), before);
+        frame(&mut a, 1.4);
+        assert_ne!((a.session.view.read_width, a.session.view.read_height), before);
+        a.run("view.readTextSize", json!({"value": 100})).unwrap();
+        frame(&mut a, 1.41);
+        assert_eq!((a.session.view.read_width, a.session.view.read_height), before);
     }
 
     /// Issue #1743: Ctrl/⌘ + wheel only zooms. The one view movement is the anchor correction that

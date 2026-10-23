@@ -560,12 +560,63 @@ pub fn render_region(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, 
 
 /// [`render_region`] with an explicit pixel cap (a small one in tests).
 fn render_region_capped(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, opts: &RenderOptions, max_pixels: u64) -> Rendered {
+    render_region_prepared(doc, page, w, h, view, opts, max_pixels, None)
+}
+
+/// Immutable drawing commands shared by the tiles of one page. Keep this with the document,
+/// layout and render options it was prepared from; it is not valid after any of them change.
+pub struct PreparedPage {
+    layers: [(f32, Vec<Draw>); 2],
+}
+
+impl PreparedPage {
+    pub fn new(doc: &Document, page: &Page, opts: &RenderOptions) -> Self {
+        Self { layers: page_layers(doc, page, &opts.display) }
+    }
+
+    /// Low-priority refinement uses a retained, single-threaded context on its calling thread.
+    /// It never borrows the foreground pool or creates another rayon pool when typing overlaps.
+    pub fn render_area(&self, doc: &Document, page: &Page, area: [f32; 4], scale: f32, opts: &RenderOptions) -> Rendered {
+        let [x, y, w, h] = area;
+        let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+        let pw = ((w * scale).ceil() as u32).clamp(1, MAX_SIDE);
+        let ph = ((h * scale).ceil() as u32).clamp(1, MAX_SIDE);
+        let view = Affine::scale(scale as f64) * Affine::translate((-x as f64, -y as f64));
+        render_region_prepared(doc, page, pw, ph, view, opts, wordcraft_geom::MAX_RASTER_PIXELS, Some(self))
+    }
+}
+
+thread_local! {
+    static REFINEMENT_CONTEXT: std::cell::RefCell<Option<RenderContext>> = const { std::cell::RefCell::new(None) };
+}
+
+fn render_region_prepared(
+    doc: &Document,
+    page: &Page,
+    w: u32,
+    h: u32,
+    view: Affine,
+    opts: &RenderOptions,
+    max_pixels: u64,
+    prepared: Option<&PreparedPage>,
+) -> Rendered {
     let (w, h) = (w.clamp(1, MAX_SIDE), h.clamp(1, MAX_SIDE));
     let (cw, ch) = wordcraft_geom::fit_pixels(w, h, max_pixels);
     // Over the cap the whole picture is drawn smaller, not cropped.
     let view = if (cw, ch) == (w, h) { view } else { Affine::scale_non_uniform(cw as f64 / w as f64, ch as f64 / h as f64) * view };
     let (w16, h16) = (cw as u16, ch as u16);
-    let mut ctx = context_pool::CONTEXTS.take(w16, h16);
+    let mut ctx = if prepared.is_some() {
+        REFINEMENT_CONTEXT.with(|slot| {
+            let mut ctx = slot
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| RenderContext::new_with(w16, h16, vello_cpu::RenderSettings { num_threads: 0, ..Default::default() }));
+            ctx.reset_and_resize(w16, h16);
+            ctx
+        })
+    } else {
+        context_pool::CONTEXTS.take(w16, h16)
+    };
     ctx.set_transform(Affine::IDENTITY);
     ctx.set_paint(color(opts.ink(doc.settings.page_color.unwrap_or(opts.paper)), 1.0));
     ctx.fill_rect(&kurbo::Rect::new(0.0, 0.0, w16 as f64, h16 as f64));
@@ -575,12 +626,20 @@ fn render_region_capped(doc: &Document, page: &Page, w: u32, h: u32, view: Affin
         draw_watermark(&mut ctx, view, page, wm, opts);
     }
     // A dimmed layer is drawn whole, then faded once, so its overlaps don't darken.
-    for (alpha, items) in page_layers(doc, page, &opts.display) {
-        let faded = alpha < 1.0 && !items.is_empty();
-        if faded {
-            ctx.push_opacity_layer(alpha);
+    let owned;
+    let layers = match prepared {
+        Some(p) => &p.layers,
+        None => {
+            owned = page_layers(doc, page, &opts.display);
+            &owned
         }
-        for it in &items {
+    };
+    for (alpha, items) in layers {
+        let faded = *alpha < 1.0 && !items.is_empty();
+        if faded {
+            ctx.push_opacity_layer(*alpha);
+        }
+        for it in items {
             draw(&mut ctx, doc, it, view, &visible, opts);
         }
         if faded {
@@ -593,7 +652,11 @@ fn render_region_capped(doc: &Document, page: &Page, w: u32, h: u32, view: Affin
     if let Some(pm) = vello_cpu::PixmapMut::new(w16, h16, &mut pixels) {
         ctx.render(pm, &mut res);
     }
-    context_pool::CONTEXTS.give_back(ctx);
+    if prepared.is_some() {
+        REFINEMENT_CONTEXT.with(|slot| *slot.borrow_mut() = Some(ctx));
+    } else {
+        context_pool::CONTEXTS.give_back(ctx);
+    }
     Rendered { width: w16 as u32, height: h16 as u32, pixels }
 }
 
@@ -882,9 +945,7 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
             let ppem = *size as f64 * px_per_pt;
             for (gid, x, y) in glyphs {
                 let (gx, gy) = (*x as f64, *y as f64);
-                // Written so a NaN position is skipped too.
-                let near = gx >= visible.x0 - 100.0 && gx <= visible.x1 && gy >= visible.y0 && gy <= visible.y1 + 200.0;
-                if !near {
+                if !gx.is_finite() || !gy.is_finite() {
                     continue;
                 }
                 if colour && let Some(d) = color_glyph::drawable(face, *gid, ppem, true) {
@@ -897,7 +958,17 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
                 if o.elements().is_empty() {
                     continue;
                 }
-                ctx.set_transform(view * Affine::translate((gx, gy)) * skew * Affine::scale(k));
+                let at = Affine::translate((gx, gy)) * skew * Affine::scale(k);
+                // Fixed margins clipped large glyphs at tile boundaries. Cull by the actual
+                // transformed outline including its stroke, not by the glyph's baseline.
+                let near = gx >= visible.x0 - 100.0 && gx <= visible.x1 && gy >= visible.y0 && gy <= visible.y1 + 200.0;
+                if !near {
+                    let bounds = at.transform_rect_bbox(kurbo::Shape::bounding_box(o.as_ref()).inflate(outline_stroke, outline_stroke));
+                    if bounds.intersect(*visible).area() <= 0.0 {
+                        continue;
+                    }
+                }
+                ctx.set_transform(view * at);
                 ctx.fill_path(&o);
                 if outline_stroke > 0.0 {
                     ctx.stroke_path(&o);
@@ -1380,6 +1451,46 @@ mod tests {
         assert!(dark > 30, "dark {dark}");
         assert_eq!(img.pixel(5, 5), [255, 255, 255, 255]);
         assert!(!img.to_png().is_empty());
+    }
+
+    #[test]
+    fn prepared_refinement_matches_foreground_and_tile_boundaries() {
+        let d = Document::from_text("Zoom refinement\nText crossing a tile boundary");
+        let l = layout(&d, &mut LayoutCache::new(), &LayoutOptions::default());
+        let page = &l.pages[0];
+        let opts = RenderOptions { text_darkening: true, ..Default::default() };
+        let mut prepared = PreparedPage::new(&d, page, &opts);
+        let full = render_page(&d, page, 1.0, &opts);
+        let refined = prepared.render_area(&d, page, [0.0, 0.0, page.w, page.h], 1.0, &opts);
+        assert_eq!(full.pixels, refined.pixels, "background preserves the existing page image");
+        // A baseline well below a narrow tile must not hide the top of a large letter.
+        for (_, items) in &mut prepared.layers {
+            for item in items {
+                if let Draw::Glyphs { size, glyphs, .. } = item {
+                    *size = 400.0;
+                    for (_, _, y) in glyphs {
+                        *y = 450.0;
+                    }
+                }
+            }
+        }
+        for scale in [1.0, 1.5] {
+            let full = prepared.render_area(&d, page, [0.0, 0.0, page.w, page.h], scale, &opts);
+            let start_px = 200;
+            let tile = prepared.render_area(&d, page, [0.0, start_px as f32 / scale, page.w, 80.0 / scale], scale, &opts);
+            let mut ink = 0;
+            for y in 0..tile.height {
+                for x in 0..tile.width {
+                    let expected = full.pixel(x, y + start_px);
+                    let actual = tile.pixel(x, y);
+                    if expected[0] < 128 {
+                        ink += 1;
+                    }
+                    assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2), "tile mismatch at {x},{y}, scale {scale}");
+                }
+            }
+            assert!(ink > 0, "fixture must cross the tile");
+        }
     }
 
     /// Table Layout › Text Direction (#226): a turned cell's text is painted running down the
